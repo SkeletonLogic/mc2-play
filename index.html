@@ -1099,7 +1099,11 @@
         addRunDependency('mc2-opfs');
         if (needGesture && !gestureTaken) { addRunDependency('mc2-gesture'); gestureDepAdded = true; }
         const install = () => populateOpfs().then(() => { bootProgress.dataChecked = true; updateBoot(); removeRunDependency('mc2-opfs'); }).catch(error => {
-          status.textContent = 'Data installation failed';
+          // Measured 2026-10-02: Firefox with "Always use private browsing mode"
+          // refuses storage.getDirectory with SecurityError, so nothing installs.
+          status.textContent = (error && error.name === 'SecurityError')
+            ? 'Your browser is blocking game storage. Private browsing mode cannot install the game -- turn it off and reload.'
+            : `Data installation failed: ${(error && error.message) || error}`;
           append(`[shell] ${error.stack || error}`);
         });
         if (embedded && needGesture) {
