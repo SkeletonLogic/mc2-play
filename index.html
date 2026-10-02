@@ -1004,9 +1004,25 @@
     }
     const bootTimer = setInterval(() => { updateBoot(); if (bootProgress.ready) clearInterval(bootTimer); }, 150);
 
+    // Embedded on the product page the game loads for every visitor, so a
+    // first-time install (~440 MiB) waits for LAUNCH; a returning player whose
+    // packs are already installed goes straight to "ready".
+    let deferredInstall = null;
+    async function dataAlreadyInstalled() {
+      try {
+        const manifest = await fetch('game-data/manifest.json').then(r => r.json());
+        const root = await navigator.storage.getDirectory();
+        for (const pack of packsFrom(manifest)) {
+          if (pack.source === 'local') continue;
+          if ((await readMarker(root, packMarkerName(pack.id))) !== pack.version) return { ok: false, bytes: manifest.bytes };
+        }
+        return { ok: true };
+      } catch (error) { return { ok: false }; }
+    }
     function takeGesture(event) {
       if (gestureTaken) return false;
       gestureTaken = true;
+      if (deferredInstall) { const install = deferredInstall; deferredInstall = null; install(); }
       if (event) { event.preventDefault(); event.stopPropagation(); }
       resumeAudio();
       bootStart.disabled = true;
@@ -1082,10 +1098,18 @@
         append(`[shell] visibilityState=${document.visibilityState} scheduler=${ENV.MC2_BROWSER_SCHEDULER || 'raf'}`);
         addRunDependency('mc2-opfs');
         if (needGesture && !gestureTaken) { addRunDependency('mc2-gesture'); gestureDepAdded = true; }
-        populateOpfs().then(() => { bootProgress.dataChecked = true; updateBoot(); removeRunDependency('mc2-opfs'); }).catch(error => {
+        const install = () => populateOpfs().then(() => { bootProgress.dataChecked = true; updateBoot(); removeRunDependency('mc2-opfs'); }).catch(error => {
           status.textContent = 'Data installation failed';
           append(`[shell] ${error.stack || error}`);
         });
+        if (embedded && needGesture) {
+          dataAlreadyInstalled().then(state => {
+            if (state.ok || gestureTaken) { install(); return; }
+            deferredInstall = install;
+            const mb = state.bytes ? `about ${Math.round(state.bytes / 1048576)} MB, once` : 'one-time download';
+            status.textContent = `Press LAUNCH to download the game (${mb})`;
+          });
+        } else install();
       }]
     };
   </script>
