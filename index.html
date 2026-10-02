@@ -247,6 +247,8 @@
       if (event.source !== window.parent || !event.data || event.data.mc2 !== 'fullscreen-state') return;
       parentFullscreen = !!event.data.active;
       fullscreenButton.textContent = parentFullscreen ? 'EXIT FULLSCREEN' : 'FULLSCREEN';
+      const bootButton = document.getElementById('boot-fullscreen');
+      if (bootButton) bootButton.textContent = parentFullscreen ? 'Windowed' : 'Fullscreen';
       if (parentFullscreen) { canvas.focus(); lockPointer(); }
       else if (document.pointerLockElement === canvas) document.exitPointerLock();
     });
@@ -1035,6 +1037,8 @@
     bootFullscreen.addEventListener('click', event => {
       event.preventDefault(); event.stopPropagation();
       resumeAudio();
+      // Embedded: same parent-page route as the side panel's button (hold-ESC).
+      if (embedded) { fullscreenButton.click(); return; }
       const toggle = document.fullscreenElement ? document.exitFullscreen()
                                                  : gameShell.requestFullscreen({ navigationUI: 'hide' });
       toggle.catch(error => append(`[shell] fullscreen request failed: ${error.message || error}`));
