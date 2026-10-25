@@ -4,6 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MechCommander 2 — Release 1.0</title>
+  <!-- PORT: an empty icon, so the browser does not request favicon.ico and log a
+       404 in the console that players then report as a download fault. -->
+  <link rel="icon" href="data:,">
   <style>
     /* Shell layout, owner's request 2026-09-30: the game fills the window; the
        title, status, buttons and log live in a collapsible right-hand panel styled
@@ -611,19 +614,60 @@
     let dataBytesDone = 0, dataBytesTotal = 0, dataFilesDone = 0, dataFilesTotal = 0;
     async function installPack(root, pack, report) {
       let completed = 0;
-      const install = async file => {
-        const response = await fetch(`game-data/${file.path}`);
-        if (!response.ok) throw new Error(`${file.path}: HTTP ${response.status}`);
+      // PORT: once a file has failed for good, the other five workers must go
+      // quiet. Measured 2026-10-24 against the old shell: a 404 did reach the
+      // catch below and set "Data installation failed", but files still in
+      // flight then called report() and overwrote it with "Installing ...
+      // 4871/4874" -- a frozen counter and no error, as the player described.
+      let failed = null;
+      const say = text => { if (!failed) report(text); };
+      // PORT: stall watchdog + retry (player report 2026-10-24: install froze at
+      // core 4872/4874 until a refresh). A fetch has no timeout of its own, so a
+      // file whose bytes stop arriving waited forever with no message. Now an
+      // attempt that receives nothing for STALL_MS (headers or body) is aborted
+      // and retried, as is any HTTP error or network failure; only the last
+      // attempt's failure reaches the "Data installation failed" message.
+      // ?stallms=N shortens the window for testing.
+      const STALL_MS = Number(shellQuery.get('stallms')) || 20000;
+      const ATTEMPTS = 4;
+      const attempt = async (file, n) => {
+        const abort = new AbortController();
+        let timer = 0;
+        const arm = () => { clearTimeout(timer); timer = setTimeout(() => abort.abort(new Error(`${file.path}: no data for ${STALL_MS / 1000} s`)), STALL_MS); };
         // Count bytes as they stream in, so the loading bars move through the
         // large archives instead of jumping when each one finishes.
-        let streamed = 0, streamEnd = 0;
-        const t0 = performance.now();
-        const counted = response.body.pipeThrough(new TransformStream({ transform(chunk, ctl) {
-          streamed += chunk.byteLength; dataBytesDone += chunk.byteLength;
-          if (window.__mc2DataProgress) window.__mc2DataProgress(dataBytesDone, dataBytesTotal, dataFilesDone, dataFilesTotal);
-          ctl.enqueue(chunk);
-        }, flush() { streamEnd = performance.now(); } }));
-        await writeInto(root, file.path, counted);
+        let streamed = 0, t0 = 0, streamEnd = 0;
+        try {
+          arm();
+          // A retry bypasses the HTTP cache so a truncated cached copy is not reused.
+          const response = await fetch(`game-data/${file.path}`, { signal: abort.signal, cache: n > 1 ? 'reload' : 'default' });
+          if (!response.ok) throw new Error(`${file.path}: HTTP ${response.status}`);
+          arm();
+          t0 = performance.now();
+          const counted = response.body.pipeThrough(new TransformStream({ transform(chunk, ctl) {
+            arm();
+            streamed += chunk.byteLength; dataBytesDone += chunk.byteLength;
+            if (window.__mc2DataProgress) window.__mc2DataProgress(dataBytesDone, dataBytesTotal, dataFilesDone, dataFilesTotal);
+            ctl.enqueue(chunk);
+          }, flush() { clearTimeout(timer); streamEnd = performance.now(); } }), { signal: abort.signal });
+          await writeInto(root, file.path, counted);
+          return { streamed, t0, streamEnd };
+        } catch (error) {
+          dataBytesDone -= streamed;   // the retry counts its bytes again
+          throw abort.signal.aborted ? abort.signal.reason : error;
+        } finally { clearTimeout(timer); }
+      };
+      const install = async file => {
+        let streamed = 0, t0 = 0, streamEnd = 0;
+        for (let n = 1; ; n++) {
+          try { ({ streamed, t0, streamEnd } = await attempt(file, n)); break; }
+          catch (error) {
+            append(`[shell] install attempt ${n}/${ATTEMPTS} failed: ${(error && error.message) || error}`);
+            if (n >= ATTEMPTS || failed) { failed ||= error; throw error; }
+            say(`Retrying ${file.path} (${n}/${ATTEMPTS - 1})...`);
+            await new Promise(resolve => setTimeout(resolve, 2000 * n));
+          }
+        }
         // ?installtrace=1: per-file timing (download vs storage commit), for diagnosis.
         if (shellQuery.get('installtrace') === '1')
           (window.__mc2InstallTrace ||= []).push({ path: file.path, size: file.size, stream: Math.round(streamEnd - t0), commit: Math.round(performance.now() - streamEnd), at: Math.round(t0) });
@@ -631,11 +675,11 @@
         dataBytesDone += Math.max(0, (file.size || 0) - streamed);
         dataFilesDone++;
         if (window.__mc2DataProgress) window.__mc2DataProgress(dataBytesDone, dataBytesTotal, dataFilesDone, dataFilesTotal);
-        report(`Installing ${pack.label} ${completed}/${pack.files.length}`);
+        say(`Installing ${pack.label} ${completed}/${pack.files.length}`);
       };
       let cursor = 0;
       await Promise.all(Array.from({ length: 6 }, async () => {
-        while (cursor < pack.files.length) await install(pack.files[cursor++]);
+        while (!failed && cursor < pack.files.length) await install(pack.files[cursor++]);
       }));
       await writeMarker(root, packMarkerName(pack.id), pack.version);
     }
