@@ -204,6 +204,7 @@
       <div class="controls">
         <button id="data-button" type="button" title="Download the game files for local play, or install them from your own copy">Download local</button>
         <button id="fullscreen" type="button">Fullscreen</button>
+        <button id="saves-button" type="button" title="Choose where your saved games are kept, or export / import them">Saved games</button>
       </div>
       <section class="panel logwrap"><h2>System log</h2><pre id="log"></pre></section>
       <div class="foot">Hold ESC to leave fullscreen</div>
@@ -892,10 +893,243 @@
     }
 
     // ---- the panel ------------------------------------------------------
+    // =====================================================================
+    // SAVED GAMES -- where a browser player's saves live (owner 2026-11-09).
+    //
+    // The game always reads and writes data/savegame in origin-private
+    // storage; nothing in the engine changes. On top of that:
+    //   * Chrome/Edge (showDirectoryPicker): the player may pick a real folder.
+    //     Saves the game writes are copied there every few seconds, and on each
+    //     visit the folder's saves are copied in BEFORE the game starts (newer
+    //     file wins). The folder handle is remembered in IndexedDB; the browser
+    //     may ask again for access, which LAUNCH requests.
+    //   * Every browser: EXPORT SAVES (a zip) and IMPORT SAVES (a zip or the
+    //     .fit/.fti files themselves).
+    // Deleting a save in the game does not delete it from the folder -- the
+    // folder only ever gains or updates files, so it is safe as a backup.
+    // =====================================================================
+    const canPickFolder = typeof window.showDirectoryPicker === 'function';
+    const saveSync = { handle: null, folderName: '', state: 'none', seen: new Map(), timer: 0 };
+    async function opfsSaveDir() {
+      let directory = await navigator.storage.getDirectory();
+      for (const part of ['data', 'savegame']) directory = await directory.getDirectoryHandle(part, { create: true });
+      return directory;
+    }
+    async function listFiles(directory) {
+      const out = new Map();
+      for await (const [name, handle] of directory.entries()) {
+        if (handle.kind !== 'file') continue;
+        try { out.set(name, await handle.getFile()); } catch { /* busy this instant; next pass */ }
+      }
+      return out;
+    }
+    async function copyInto(directory, name, data) {
+      const handle = await directory.getFileHandle(name, { create: true });
+      const writable = await handle.createWritable();
+      await writable.write(data);
+      await writable.close();
+    }
+    const fileStamp = file => `${file.size}:${file.lastModified}`;
+    function kvOpen() {
+      return new Promise((resolve, reject) => {
+        const request = indexedDB.open('mc2-shell', 1);
+        request.onupgradeneeded = () => request.result.createObjectStore('kv');
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+    }
+    async function kvGet(key) {
+      const db = await kvOpen();
+      return new Promise((resolve, reject) => {
+        const request = db.transaction('kv').objectStore('kv').get(key);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+    }
+    async function kvSet(key, value) {
+      const db = await kvOpen();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction('kv', 'readwrite');
+        if (value === undefined) tx.objectStore('kv').delete(key); else tx.objectStore('kv').put(value, key);
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+    // Folder -> game: saves that are new, or newer, in the folder.
+    async function pullFromFolder() {
+      const source = await listFiles(saveSync.handle);
+      const target = await opfsSaveDir();
+      const have = await listFiles(target);
+      let count = 0;
+      for (const [name, file] of source) {
+        const mine = have.get(name);
+        if (!mine || file.lastModified > mine.lastModified + 2000) { await copyInto(target, name, await file.arrayBuffer()); count++; }
+      }
+      // Remember the game-side copies so the push loop does not echo them back.
+      for (const [name, file] of await listFiles(target)) saveSync.seen.set(name, fileStamp(file));
+      return count;
+    }
+    // Game -> folder: anything the game has written since the last look.
+    async function pushToFolder() {
+      if (saveSync.state !== 'active' || !saveSync.handle) return 0;
+      let count = 0;
+      for (const [name, file] of await listFiles(await opfsSaveDir())) {
+        const stamp = fileStamp(file);
+        if (saveSync.seen.get(name) === stamp) continue;
+        await copyInto(saveSync.handle, name, await file.arrayBuffer());
+        saveSync.seen.set(name, stamp);
+        count++;
+      }
+      if (count) append(`[shell] saves: copied ${count} file(s) to "${saveSync.folderName}"`);
+      return count;
+    }
+    async function startSaveSync(interactive) {
+      if (!saveSync.handle) return false;
+      let permission = await saveSync.handle.queryPermission({ mode: 'readwrite' });
+      if (permission !== 'granted' && interactive) permission = await saveSync.handle.requestPermission({ mode: 'readwrite' });
+      if (permission !== 'granted') { saveSync.state = 'needs-permission'; return false; }
+      const pulled = await pullFromFolder();
+      saveSync.state = 'active';
+      saveSync.seen.clear();            // first push copies every game save out
+      await pushToFolder();
+      append(`[shell] saves: using folder "${saveSync.folderName}" (${pulled} brought in)`);
+      clearInterval(saveSync.timer);
+      saveSync.timer = setInterval(() => pushToFolder().catch(error => append(`[shell] saves: copy failed: ${error.message || error}`)), 3000);
+      return true;
+    }
+    async function useSaveFolder(handle, interactive) {
+      clearInterval(saveSync.timer);
+      saveSync.handle = handle; saveSync.folderName = handle ? handle.name : ''; saveSync.state = handle ? 'chosen' : 'none';
+      saveSync.seen.clear();
+      await kvSet('saveFolder', handle || undefined);
+      return handle ? startSaveSync(interactive) : false;
+    }
+    // Restore a remembered folder. Runs before the game is allowed to start
+    // (run dependency 'mc2-saves', added in preRun), so its saves are in place.
+    const saveRestore = (async () => {
+      if (!canPickFolder) return;
+      try {
+        const handle = await kvGet('saveFolder');
+        if (!handle) return;
+        saveSync.handle = handle; saveSync.folderName = handle.name; saveSync.state = 'chosen';
+        await startSaveSync(false);
+      } catch (error) { append(`[shell] saves: could not reopen the save folder: ${error.message || error}`); }
+    })();
+    window.__mc2Saves = { useSaveFolder, pushToFolder, importSaves: (...a) => importSaves(...a), exportSaves: () => exportSaves(), state: () => ({ ...saveSync, seen: saveSync.seen.size }) };   // diagnostics
+
+    function storedZip(files) {
+      const chunks = [], central = [];
+      let offset = 0;
+      for (const { name: fileName, data } of files) {
+        const name = new TextEncoder().encode(fileName);
+        const sum = crc32(data);
+        const local = new DataView(new ArrayBuffer(30));
+        local.setUint32(0, 0x04034b50, true); local.setUint16(4, 20, true);
+        local.setUint32(14, sum, true); local.setUint32(18, data.length, true); local.setUint32(22, data.length, true);
+        local.setUint16(26, name.length, true);
+        chunks.push(new Uint8Array(local.buffer), name, data);
+        const entry = new DataView(new ArrayBuffer(46));
+        entry.setUint32(0, 0x02014b50, true); entry.setUint16(4, 20, true); entry.setUint16(6, 20, true);
+        entry.setUint32(16, sum, true); entry.setUint32(20, data.length, true); entry.setUint32(24, data.length, true);
+        entry.setUint16(28, name.length, true); entry.setUint32(42, offset, true);
+        central.push(new Uint8Array(entry.buffer), name);
+        offset += 30 + name.length + data.length;
+      }
+      const directoryBytes = central.reduce((n, c) => n + c.length, 0);
+      const end = new DataView(new ArrayBuffer(22));
+      end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+      end.setUint32(12, directoryBytes, true); end.setUint32(16, offset, true);
+      return new Blob([...chunks, ...central, new Uint8Array(end.buffer)], { type: 'application/zip' });
+    }
+    async function exportSaves() {
+      const files = [];
+      for (const [name, file] of await listFiles(await opfsSaveDir()))
+        files.push({ name, data: new Uint8Array(await file.arrayBuffer()) });
+      if (!files.length) throw new Error('there are no saved games yet');
+      const url = URL.createObjectURL(storedZip(files));
+      const anchor = document.createElement('a');
+      anchor.href = url; anchor.download = `mc2-saves-${new Date().toISOString().slice(0, 10)}.zip`;
+      anchor.click();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      return files.length;
+    }
+    async function importSaves(fileList) {
+      const target = await opfsSaveDir();
+      let count = 0;
+      for (const file of fileList) {
+        if (/\.zip$/i.test(file.name)) {
+          const buffer = await file.arrayBuffer();
+          for (const entry of readStoredZip(buffer)) {
+            const base = entry.name.split('/').pop();
+            if (!base || !/\.(fit|fti|ims)$/i.test(base)) continue;
+            await copyInto(target, base, new Uint8Array(buffer, entry.dataOffset, entry.size)); count++;
+          }
+        } else if (/\.(fit|fti|ims)$/i.test(file.name)) {
+          await copyInto(target, file.name, await file.arrayBuffer()); count++;
+        }
+      }
+      if (saveSync.state === 'active') await pushToFolder();
+      return count;
+    }
+    function renderSaves() {
+      dataBody.innerHTML = '';
+      const card = (title, text) => {
+        const box = document.createElement('div'); box.className = 'pack';
+        const h = document.createElement('h3'); h.textContent = title;
+        const meta = document.createElement('div'); meta.className = 'meta'; meta.textContent = text;
+        const actions = document.createElement('div'); actions.className = 'actions';
+        box.append(h, meta, actions); dataBody.append(box);
+        return { meta, actions };
+      };
+      const button = (label, onClick) => {
+        const b = document.createElement('button'); b.type = 'button'; b.textContent = label;
+        b.addEventListener('click', async () => {
+          try { await onClick(); } catch (error) { if (error && error.name !== 'AbortError') status.textContent = `Saved games: ${error.message || error}`; }
+          renderSaves();
+        });
+        return b;
+      };
+      const where = {
+        none: 'Your saves are kept in this browser only.',
+        chosen: `Folder "${saveSync.folderName}" is chosen.`,
+        'needs-permission': `Folder "${saveSync.folderName}" needs your permission again -- press ALLOW ACCESS (or LAUNCH).`,
+        active: `Saves are copied to your folder "${saveSync.folderName}" as you play, and read from it on every visit.`,
+      }[saveSync.state];
+      const folder = card('Save folder', canPickFolder ? where
+        : 'Choosing a folder needs Chrome or Edge. In this browser your saves stay in the browser -- use Export below to keep a copy.');
+      if (canPickFolder) {
+        folder.actions.append(button(saveSync.handle ? 'Change folder' : 'Choose folder', async () => {
+          const handle = await window.showDirectoryPicker({ id: 'mc2-saves', mode: 'readwrite' });
+          await useSaveFolder(handle, true);
+          status.textContent = `Saved games: using folder "${handle.name}"`;
+        }));
+        if (saveSync.state === 'needs-permission')
+          folder.actions.append(button('Allow access', () => startSaveSync(true)));
+        if (saveSync.handle)
+          folder.actions.append(button('Stop using folder', () => useSaveFolder(null, false)));
+      }
+      const io = card('Export / import', 'Export downloads all your saves as one zip. Import takes that zip, or .fit save files from the Windows game.');
+      io.actions.append(button('Export saves', async () => { status.textContent = `Saved games: exported ${await exportSaves()} file(s)`; }));
+      io.actions.append(button('Import saves', () => new Promise(resolve => {
+        const picker = document.createElement('input');
+        picker.type = 'file'; picker.multiple = true; picker.accept = '.zip,.fit,.fti,.ims';
+        picker.addEventListener('change', async () => {
+          try { status.textContent = `Saved games: imported ${await importSaves(picker.files)} file(s) -- open Load Game to see them`; }
+          catch (error) { status.textContent = `Saved games: import failed: ${error.message || error}`; }
+          resolve();
+        });
+        picker.click();
+      })));
+    }
+    document.getElementById('saves-button').addEventListener('click', () => {
+      dataPanel.querySelector('h2').textContent = 'Saved games';
+      renderSaves(); dataPanel.showModal();
+    });
+
     const dataPanel = document.getElementById('data-panel');
     const dataBody = document.getElementById('data-body');
     document.getElementById('data-close').addEventListener('click', () => dataPanel.close());
-    document.getElementById('data-button').addEventListener('click', () => { renderPacks(); dataPanel.showModal(); });
+    document.getElementById('data-button').addEventListener('click', () => { dataPanel.querySelector('h2').textContent = 'Download local'; renderPacks(); dataPanel.showModal(); });
 
     function renderPacks() {
       dataBody.innerHTML = '';
@@ -1067,6 +1301,11 @@
       if (gestureTaken) return false;
       gestureTaken = true;
       if (deferredInstall) { const install = deferredInstall; deferredInstall = null; install(); }
+      if (saveSync.state === 'needs-permission') {
+        addRunDependency('mc2-saves-launch');
+        startSaveSync(true).catch(error => append(`[shell] saves: ${error.message || error}`))
+          .finally(() => removeRunDependency('mc2-saves-launch'));
+      }
       if (event) { event.preventDefault(); event.stopPropagation(); }
       resumeAudio();
       bootStart.disabled = true;
@@ -1140,6 +1379,22 @@
         // without recording these is not evidence about background execution.
         requestAnimationFrame(() => { window.__mc2RafFired = true; });
         append(`[shell] visibilityState=${document.visibilityState} scheduler=${ENV.MC2_BROWSER_SCHEDULER || 'raf'}`);
+        // Browser check (2026-11-09). Safari before 26 has neither WebGPU nor
+        // FileSystemFileHandle.createWritable, which the installer needs; say
+        // so up front instead of failing halfway through the download.
+        {
+          const missing = [];
+          if (!navigator.gpu) missing.push('WebGPU');
+          if (!(window.FileSystemFileHandle && 'createWritable' in FileSystemFileHandle.prototype)) missing.push('file storage');
+          if (missing.length) {
+            status.textContent = `This browser is missing ${missing.join(' and ')}. Use Chrome or Edge, Firefox 141+, or Safari 26+.`;
+            append(`[shell] unsupported browser: missing ${missing.join(', ')}`);
+            addRunDependency('mc2-unsupported');   // never removed: the game cannot run here
+            return;
+          }
+        }
+        addRunDependency('mc2-saves');
+        saveRestore.finally(() => removeRunDependency('mc2-saves'));
         addRunDependency('mc2-opfs');
         if (needGesture && !gestureTaken) { addRunDependency('mc2-gesture'); gestureDepAdded = true; }
         const install = () => populateOpfs().then(() => { bootProgress.dataChecked = true; updateBoot(); removeRunDependency('mc2-opfs'); }).catch(error => {
